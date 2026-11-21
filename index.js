@@ -1,14 +1,24 @@
 /**
  * Host half of the GPU temperature bundle.
  *
- * Polls `nvidia-smi` for die temperature plus clocks/power/link, caches the
- * last snapshot, and serves it to the Web page from one read-only route.
- * Nothing is written anywhere; the route only reads.
+ * Polls `nvidia-smi` for die/memory temperature plus clocks/power/link, reads
+ * the motherboard fan channel (nct6798 pwm N), and speaks to the privileged
+ * `gpu-fan-control` daemon over its Unix socket so the Web UI can change the
+ * fan curve without running as root.
  */
 import { execFile } from 'node:child_process';
+import { readFileSync, readdirSync } from 'node:fs';
+import net from 'node:net';
 
 /** Read-only snapshot route consumed by the Client half. */
 const ROUTE_PATH = '/gpu-temp/state';
+/** Fan curve route (GET reads, POST applies). */
+const FAN_PATH = '/gpu-temp/fan';
+/** Fan daemon socket. */
+const DEFAULT_SOCKET = '/run/gpu-fan-control.sock';
+
+/** Supervisor chips the nct6775 driver may bind. */
+const HWMON_NAMES = ['nct6798', 'nct6799', 'nct6775', 'nct6776', 'nct6779', 'nct6796'];
 
 /** Fields asked from nvidia-smi, in display order. */
 const QUERY_FIELDS = [
@@ -42,6 +52,76 @@ function num(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function findHwmon() {
+  let dirs = [];
+  try {
+    dirs = readdirSync('/sys/class/hwmon', { withFileTypes: true }).map((e) => `/sys/class/hwmon/${e.name}`);
+  } catch {
+    return null;
+  }
+  for (const dir of dirs) {
+    try {
+      if (HWMON_NAMES.includes(readFileSync(`${dir}/name`, 'utf8').trim())) return dir;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+function readAttr(dir, name) {
+  try {
+    return readFileSync(`${dir}/${name}`, 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+/** Read the controlled fan channel; null when no Super I/O or channel. */
+function readFan(channel) {
+  const dir = findHwmon();
+  if (dir === null) return null;
+  const pwm = num(readAttr(dir, `pwm${channel}`));
+  const rpm = num(readAttr(dir, `fan${channel}_input`));
+  if (pwm === null) return null;
+  return {
+    channel,
+    pwm,
+    duty: Math.round((pwm / 255) * 1000) / 10,
+    rpm,
+    manual: readAttr(dir, `pwm${channel}_enable`) === '1',
+  };
+}
+
+/** One request/response line on the fan daemon socket. */
+function socketCommand(path, message, timeoutMs) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ path });
+    let buffer = '';
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(value);
+    };
+    socket.setTimeout(timeoutMs, () => finish({ ok: false, error: 'socket timeout' }));
+    socket.on('connect', () => socket.write(`${JSON.stringify(message)}\n`));
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf8');
+      const line = buffer.split('\n')[0];
+      if (line.trim() === '') return;
+      try {
+        finish(JSON.parse(line));
+      } catch {
+        finish({ ok: false, error: 'bad daemon reply' });
+      }
+    });
+    socket.on('error', (error) => finish({ ok: false, error: error.message }));
+    socket.on('close', () => finish({ ok: false, error: 'daemon closed' }));
+  });
+}
+
 /** Parse `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` lines. */
 function parseQuery(stdout) {
   const gpus = [];
@@ -72,14 +152,24 @@ function parseMemoryTemp(stdout, gpus) {
   });
 }
 
+/** Normalize the daemon's point list into `t:d,t:d` text. */
+function curveText(points) {
+  if (!Array.isArray(points)) return '';
+  return points.map((p) => `${Number(p[0])}:${Number(p[1])}`).join(',');
+}
+
 /**
- * Activate the poller and the snapshot route.
+ * Activate the poller and the routes.
  * @param ctx - Host plugin context.
  * @param config - Resolved row config from the bundle patch.
  */
 export function apply(ctx, config = {}) {
   const pollIntervalMs = clampNumber(config.pollIntervalMs, 5_000, 1_000, 60_000);
   const timeoutMs = clampNumber(config.timeoutMs, 4_000, 1_000, 30_000);
+  const fanChannel = clampNumber(config.fanPwm, 6, 1, 8);
+  const socketPath = typeof config.socket === 'string' && config.socket.trim() !== ''
+    ? config.socket.trim()
+    : DEFAULT_SOCKET;
 
   let snapshot = Object.freeze({ ok: false, ts: null, gpus: [], error: { code: 'pending' } });
   let inFlight = null;
@@ -92,15 +182,18 @@ export function apply(ctx, config = {}) {
       timeoutMs,
     );
     if (query.error !== undefined) {
-      return { ok: false, ts: new Date().toISOString(), gpus: [], error: { code: 'exec', message: query.error } };
+      return { ok: false, ts: new Date().toISOString(), gpus: [], fan: readFan(fanChannel), error: { code: 'exec', message: query.error } };
     }
     const gpus = parseQuery(query.stdout);
     if (gpus.length === 0) {
-      return { ok: false, ts: new Date().toISOString(), gpus: [], error: { code: 'no-gpu' } };
+      return { ok: false, ts: new Date().toISOString(), gpus: [], fan: readFan(fanChannel), error: { code: 'no-gpu' } };
     }
     const detailed = await run('nvidia-smi', ['-q', '-d', 'TEMPERATURE'], timeoutMs);
     if (detailed.stdout !== undefined) parseMemoryTemp(detailed.stdout, gpus);
-    return { ok: true, ts: new Date().toISOString(), gpus };
+    const curve = await socketCommand(socketPath, { cmd: 'get_curve' }, 1_000);
+    const fan = readFan(fanChannel);
+    if (fan !== null) fan.curve = curve.ok === true ? curveText(curve.curve) : null;
+    return { ok: true, ts: new Date().toISOString(), gpus, fan };
   }
 
   async function refresh(force) {
@@ -116,6 +209,7 @@ export function apply(ctx, config = {}) {
           ok: false,
           ts: new Date().toISOString(),
           gpus: [],
+          fan: readFan(fanChannel),
           error: { code: 'internal', message: error instanceof Error ? error.message : String(error) },
         });
       } finally {
@@ -153,5 +247,31 @@ export function apply(ctx, config = {}) {
         },
       }),
     'gpu-temp: snapshot route',
+  );
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: FAN_PATH,
+        resource: async (request) => {
+          // The web server answers GET/HEAD only; the curve rides in a query
+          // parameter because a POST would be refused before reaching us.
+          const curve = new URL(request.url).searchParams.get('curve');
+          const payload = curve === null
+            ? await socketCommand(socketPath, { cmd: 'get_curve' }, 1_000)
+            : await socketCommand(socketPath, { cmd: 'set_curve', curve }, 2_000);
+          if (curve !== null) await refresh(true);
+          return new Response(JSON.stringify(payload), {
+            status: payload.ok === true ? 200 : 400,
+            headers: {
+              'content-type': 'application/json; charset=utf-8',
+              'cache-control': 'no-store',
+              'x-content-type-options': 'nosniff',
+            },
+          });
+        },
+      }),
+    'gpu-temp: fan route',
   );
 }

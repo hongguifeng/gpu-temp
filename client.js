@@ -20,6 +20,14 @@ window.__ModuleLoader__.load({
     const STATE_URL = '/gpu-temp/state';
     /** How often the browser re-reads the Host snapshot while visible. */
     const POLL_MS = 5_000;
+    /** Route that applies a fan curve on the Host half. */
+    const FAN_URL = '/gpu-temp/fan';
+    /** Preset curves offered next to the editor. */
+    const PRESETS = [
+      ['quiet', '40:20,50:25,60:35,70:50,80:70,85:100'],
+      ['balance', '40:20,50:30,60:45,70:75,80:100'],
+      ['max', '30:100,40:100'],
+    ];
     /** Opened panel width, capped to the viewport at render time. */
     const PANEL_WIDTH = 300;
 
@@ -40,6 +48,18 @@ window.__ModuleLoader__.load({
       aria: 'GPU temperature',
       open: 'Show all GPUs',
       close: 'Close GPU list',
+      fan: 'Fan',
+      auto: 'auto',
+      manual: 'manual',
+      apply: 'Apply',
+      applying: 'Applying…',
+      quiet: 'Quiet',
+      balance: 'Balanced',
+      max: 'Full',
+      curvePlaceholder: '40:20,50:30,60:45,70:75,80:100',
+      curveBad: 'Bad curve',
+      curveOk: 'Curve applied',
+      noFan: 'No fan channel',
     };
 
     const zh = {
@@ -59,6 +79,18 @@ window.__ModuleLoader__.load({
       aria: 'GPU 温度',
       open: '查看全部显卡',
       close: '关闭显卡列表',
+      fan: '风扇',
+      auto: '自动',
+      manual: '手动',
+      apply: '应用',
+      applying: '应用中…',
+      quiet: '静音',
+      balance: '均衡',
+      max: '全速',
+      curvePlaceholder: '40:20,50:30,60:45,70:75,80:100',
+      curveBad: '曲线格式不对',
+      curveOk: '曲线已应用',
+      noFan: '未检测到风扇通道',
     };
 
     const CSS = `
@@ -101,6 +133,25 @@ window.__ModuleLoader__.load({
 .gt-link:hover{background:var(--dsw-alias-bg-layer-2)}
 .gt-link:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
 .gt-error{color:var(--dsw-alias-state-error-primary)}
+.gt-fan{display:flex;flex-direction:column;gap:6px;border-top:.5px solid var(--dsw-alias-border-l1);padding-top:9px}
+.gt-fan-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.gt-fan-title{color:var(--dsw-alias-label-primary);font-size:12px;font-weight:600}
+.gt-fan-state{color:var(--dsw-alias-label-secondary);font-size:11px;font-variant-numeric:tabular-nums}
+.gt-fan-edit{display:flex;gap:6px}
+.gt-input{flex:1;min-width:0;height:24px;padding:0 7px;border-radius:6px;
+  border:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);
+  color:var(--dsw-alias-label-primary);font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
+.gt-input:focus{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.gt-btn{appearance:none;border:0;height:24px;padding:0 9px;border-radius:6px;cursor:pointer;
+  background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px}
+.gt-btn:hover{color:var(--dsw-alias-label-primary)}
+.gt-btn:disabled{opacity:.55;cursor:default}
+.gt-btn.is-primary{background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
+.gt-btn.is-primary:hover{background:var(--dsw-alias-button-primary-hover)}
+.gt-presets{display:flex;gap:6px}
+.gt-msg{font-size:11px}
+.gt-msg.is-ok{color:var(--dsw-alias-state-success-primary,var(--dsw-alias-state-warn-primary))}
+.gt-msg.is-err{color:var(--dsw-alias-state-error-primary)}
 `;
 
     /**
@@ -131,6 +182,9 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false);
       const [open, setOpen] = React.useState(false);
       const [position, setPosition] = React.useState(undefined);
+      const [fanDraft, setFanDraft] = React.useState('');
+      const [fanBusy, setFanBusy] = React.useState(false);
+      const [fanMsg, setFanMsg] = React.useState(null);
       const anchorRef = React.useRef(null);
       const panelRef = React.useRef(null);
       const alive = React.useRef(true);
@@ -221,6 +275,40 @@ window.__ModuleLoader__.load({
         };
       }, [open]);
 
+      // Seed the curve editor from the Host snapshot when the panel opens.
+      React.useEffect(() => {
+        if (!open) return;
+        const curve = view.data?.fan?.curve;
+        if (typeof curve === 'string' && curve !== '') setFanDraft(curve);
+      }, [open]);
+
+      const applyCurve = React.useCallback(
+        async (value) => {
+          const curve = String(value ?? fanDraft).trim();
+          setFanBusy(true);
+          setFanMsg(null);
+          try {
+            const response = await fetch(`${FAN_URL}?curve=${encodeURIComponent(curve)}`, {
+              cache: 'no-store',
+              headers: { accept: 'application/json' },
+            });
+            const reply = await response.json();
+            if (reply.ok === true) {
+              setFanDraft(curve);
+              setFanMsg({ ok: true, text: translate('curveOk') });
+              void load(false);
+            } else {
+              setFanMsg({ ok: false, text: String(reply.error ?? translate('curveBad')) });
+            }
+          } catch (error) {
+            setFanMsg({ ok: false, text: error instanceof Error ? error.message : String(error) });
+          } finally {
+            setFanBusy(false);
+          }
+        },
+        [fanDraft, load, translate],
+      );
+
       const data = view.status === 'ready' ? view.data : undefined;
       const gpus = Array.isArray(data?.gpus) ? data.gpus : [];
       const hottest = gpus.reduce(
@@ -233,6 +321,58 @@ window.__ModuleLoader__.load({
       const label = temp === null
         ? h('span', { className: 'gt-error' }, translate(view.status === 'unreachable' ? 'error' : 'none'))
         : h('span', { className: `gt-v${level === 'ok' ? '' : ` is-${level}`}` }, `${Math.round(temp)}°C`);
+
+      const fan = data?.fan ?? null;
+      const fanSection = h(
+        'div',
+        { className: 'gt-fan' },
+        h(
+          'div',
+          { className: 'gt-fan-head' },
+          h('span', { className: 'gt-fan-title' }, translate('fan')),
+          h(
+            'span',
+            { className: 'gt-fan-state' },
+            fan === null
+              ? translate('noFan')
+              : `${fan.rpm ?? '?'} RPM · ${fan.duty}% · ${fan.manual ? translate('manual') : translate('auto')}`,
+          ),
+        ),
+        fan === null
+          ? null
+          : h(
+              'div',
+              { className: 'gt-fan-edit' },
+              h('input', {
+                className: 'gt-input',
+                value: fanDraft,
+                placeholder: translate('curvePlaceholder'),
+                spellCheck: false,
+                onChange: (event) => setFanDraft(event.target.value),
+              }),
+              h(
+                'button',
+                { type: 'button', className: 'gt-btn is-primary', disabled: fanBusy, onClick: () => void applyCurve() },
+                translate(fanBusy ? 'applying' : 'apply'),
+              ),
+            ),
+        fan === null
+          ? null
+          : h(
+              'div',
+              { className: 'gt-presets' },
+              PRESETS.map(([key, curve]) =>
+                h(
+                  'button',
+                  { key, type: 'button', className: 'gt-btn', disabled: fanBusy, onClick: () => void applyCurve(curve) },
+                  translate(key),
+                ),
+              ),
+            ),
+        fanMsg === null
+          ? null
+          : h('span', { className: `gt-msg ${fanMsg.ok ? 'is-ok' : 'is-err'}` }, fanMsg.text),
+      );
 
       const panel = open
         ? ReactDOM.createPortal(
@@ -278,6 +418,7 @@ window.__ModuleLoader__.load({
                       h('div', { className: 'gt-row-foot' }, h('span', null, meta.join(' · '))),
                     );
                   }),
+              fanSection,
               h(
                 'div',
                 { className: 'gt-panel-foot' },
