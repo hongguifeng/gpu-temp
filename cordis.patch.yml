@@ -1,0 +1,5 @@
+- insert:
+    - id: gpu-temp
+      name: '@local/gpu-temp'
+      config:
+        pollIntervalMs: 5000

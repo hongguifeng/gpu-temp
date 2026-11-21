@@ -1,0 +1,1 @@
+{ "name": "GPU", "temp": "temp", "clock": "SM", "power": "power", "link": "link", "none": "no GPU", "error": "nvidia-smi failed", "aria": "GPU temperature" }
