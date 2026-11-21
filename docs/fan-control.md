@@ -117,3 +117,20 @@ GPU 73°C -> duty 71% -> pwm6=181 -> 2812 RPM
 守护进程校验后立即生效。这样 Web UI 不需要 root 权限。
 
 插件路由：`/gpu-temp/fan`（GET 读曲线，POST 应用曲线）。
+
+### 7.1 恢复默认（BIOS 自动）
+
+面板里还有一个 **「默认」** 按钮：点它会执行 `set_mode=auto`，
+守护进程把 `pwmX_enable` 写回 **5**（BIOS 自动曲线）并停止写 `pwm`；
+再点「应用」或任一预设会切回 `manual`。
+
+命令行等价：
+
+```bash
+# 恢复 BIOS 自动
+sudo python3 tools/gpu_fan_control.py --pwm 6 --keep-manual  # 仅示意；实际用 socket
+# 或直接：
+echo 5 | sudo tee /sys/class/hwmon/hwmon<N>/pwm6_enable
+```
+
+> hwmon 编号会变（本机从 hwmon7 变成 hwmon5），脚本按 `name=nct6798` 查找，不要写死编号。

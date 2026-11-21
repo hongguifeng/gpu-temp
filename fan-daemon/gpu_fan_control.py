@@ -40,7 +40,7 @@ def parse_curve(text):
     return points
 
 
-def serve_socket(path, state, lock):
+def serve_socket(path, state, lock, hwmon_dir, enable_name):
     """Accept one-line JSON commands and update the shared curve."""
     try:
         os.unlink(path)
@@ -73,10 +73,20 @@ def serve_socket(path, state, lock):
                         state["curve"] = points
                     print(f"[socket] curve -> {msg['curve']}", flush=True)
                     conn.sendall((json.dumps({"ok": True, "curve": points}) + "\n").encode())
+                elif msg.get("cmd") == "set_mode":
+                    mode = msg.get("mode")
+                    if mode not in ("auto", "manual"):
+                        raise ValueError("mode must be auto|manual")
+                    write_attr(hwmon_dir, enable_name, 5 if mode == "auto" else 1)
+                    with lock:
+                        state["mode"] = mode
+                    print(f"[socket] mode -> {mode}", flush=True)
+                    conn.sendall((json.dumps({"ok": True, "mode": mode}) + "\n").encode())
                 elif msg.get("cmd") == "get_curve":
                     with lock:
                         points = state["curve"]
-                    conn.sendall((json.dumps({"ok": True, "curve": points}) + "\n").encode())
+                        mode = state["mode"]
+                    conn.sendall((json.dumps({"ok": True, "curve": points, "mode": mode}) + "\n").encode())
                 else:
                     conn.sendall((json.dumps({"ok": False, "error": "unknown cmd"}) + "\n").encode())
             except Exception as error:
@@ -168,7 +178,7 @@ def main() -> int:
     a = ap.parse_args()
 
     curve = parse_curve(a.curve)
-    state = {"curve": curve, "stop": False}
+    state = {"curve": curve, "stop": False, "mode": "manual"}
     lock = threading.Lock()
     path, name = find_hwmon()
     if path is None:
@@ -202,7 +212,7 @@ def main() -> int:
 
     if not a.dry_run:
         write_attr(path, enable, 1)
-        threading.Thread(target=serve_socket, args=(a.socket, state, lock), daemon=True).start()
+        threading.Thread(target=serve_socket, args=(a.socket, state, lock, path, enable), daemon=True).start()
 
     while True:
         temp = read_gpu_temp(a.mem_temp)
@@ -219,7 +229,9 @@ def main() -> int:
                 print(f"GPU {temp:.0f}°C → duty {duty:.0f}%", flush=True)
             else:
                 duty = last
-        if not a.dry_run:
+        with lock:
+            mode = state["mode"]
+        if not a.dry_run and mode == "manual":
             write_attr(path, pwm, int(round(duty / 100 * 255)))
         else:
             print(f"(dry-run) {pwm}={int(round(duty / 100 * 255))} fan={read_attr(path, f'fan{a.pwm}_input')} RPM", flush=True)

@@ -192,7 +192,10 @@ export function apply(ctx, config = {}) {
     if (detailed.stdout !== undefined) parseMemoryTemp(detailed.stdout, gpus);
     const curve = await socketCommand(socketPath, { cmd: 'get_curve' }, 1_000);
     const fan = readFan(fanChannel);
-    if (fan !== null) fan.curve = curve.ok === true ? curveText(curve.curve) : null;
+    if (fan !== null) {
+      fan.curve = curve.ok === true ? curveText(curve.curve) : null;
+      fan.mode = curve.ok === true ? curve.mode ?? null : null;
+    }
     return { ok: true, ts: new Date().toISOString(), gpus, fan };
   }
 
@@ -255,13 +258,16 @@ export function apply(ctx, config = {}) {
         kind: 'exact',
         path: FAN_PATH,
         resource: async (request) => {
-          // The web server answers GET/HEAD only; the curve rides in a query
-          // parameter because a POST would be refused before reaching us.
-          const curve = new URL(request.url).searchParams.get('curve');
-          const payload = curve === null
-            ? await socketCommand(socketPath, { cmd: 'get_curve' }, 1_000)
-            : await socketCommand(socketPath, { cmd: 'set_curve', curve }, 2_000);
-          if (curve !== null) await refresh(true);
+          // The web server answers GET/HEAD only; commands ride in query
+          // parameters because a POST would be refused before reaching us.
+          const params = new URL(request.url).searchParams;
+          const mode = params.get('mode');
+          const curve = params.get('curve');
+          let payload = null;
+          if (mode !== null) payload = await socketCommand(socketPath, { cmd: 'set_mode', mode }, 2_000);
+          if (curve !== null) payload = await socketCommand(socketPath, { cmd: 'set_curve', curve }, 2_000);
+          if (mode === null && curve === null) payload = await socketCommand(socketPath, { cmd: 'get_curve' }, 1_000);
+          if (mode !== null || curve !== null) await refresh(true);
           return new Response(JSON.stringify(payload), {
             status: payload.ok === true ? 200 : 400,
             headers: {

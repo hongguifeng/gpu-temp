@@ -60,6 +60,8 @@ window.__ModuleLoader__.load({
       curveBad: 'Bad curve',
       curveOk: 'Curve applied',
       noFan: 'No fan channel',
+      autoMode: 'Default',
+      autoOk: 'BIOS control restored',
     };
 
     const zh = {
@@ -91,6 +93,8 @@ window.__ModuleLoader__.load({
       curveBad: '曲线格式不对',
       curveOk: '曲线已应用',
       noFan: '未检测到风扇通道',
+      autoMode: '默认',
+      autoOk: '已恢复 BIOS 控制',
     };
 
     const CSS = `
@@ -288,7 +292,7 @@ window.__ModuleLoader__.load({
           setFanBusy(true);
           setFanMsg(null);
           try {
-            const response = await fetch(`${FAN_URL}?curve=${encodeURIComponent(curve)}`, {
+            const response = await fetch(`${FAN_URL}?curve=${encodeURIComponent(curve)}&mode=manual`, {
               cache: 'no-store',
               headers: { accept: 'application/json' },
             });
@@ -308,6 +312,25 @@ window.__ModuleLoader__.load({
         },
         [fanDraft, load, translate],
       );
+
+      const setAuto = React.useCallback(async () => {
+        setFanBusy(true);
+        setFanMsg(null);
+        try {
+          const response = await fetch(`${FAN_URL}?mode=auto`, { cache: 'no-store', headers: { accept: 'application/json' } });
+          const reply = await response.json();
+          if (reply.ok === true) {
+            setFanMsg({ ok: true, text: translate('autoOk') });
+            void load(false);
+          } else {
+            setFanMsg({ ok: false, text: String(reply.error ?? translate('curveBad')) });
+          }
+        } catch (error) {
+          setFanMsg({ ok: false, text: error instanceof Error ? error.message : String(error) });
+        } finally {
+          setFanBusy(false);
+        }
+      }, [load, translate]);
 
       const data = view.status === 'ready' ? view.data : undefined;
       const gpus = Array.isArray(data?.gpus) ? data.gpus : [];
@@ -335,7 +358,7 @@ window.__ModuleLoader__.load({
             { className: 'gt-fan-state' },
             fan === null
               ? translate('noFan')
-              : `${fan.rpm ?? '?'} RPM · ${fan.duty}% · ${fan.manual ? translate('manual') : translate('auto')}`,
+              : `${fan.rpm ?? '?'} RPM · ${fan.duty}% · ${fan.mode === 'auto' || !fan.manual ? translate('auto') : translate('manual')}`,
           ),
         ),
         fan === null
@@ -361,6 +384,11 @@ window.__ModuleLoader__.load({
           : h(
               'div',
               { className: 'gt-presets' },
+              h(
+                'button',
+                { type: 'button', className: 'gt-btn', disabled: fanBusy, onClick: () => void setAuto() },
+                translate('autoMode'),
+              ),
               PRESETS.map(([key, curve]) =>
                 h(
                   'button',
