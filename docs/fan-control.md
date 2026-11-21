@@ -134,3 +134,16 @@ echo 5 | sudo tee /sys/class/hwmon/hwmon<N>/pwm6_enable
 ```
 
 > hwmon 编号会变（本机从 hwmon7 变成 hwmon5），脚本按 `name=nct6798` 查找，不要写死编号。
+
+## 8. 驱动掉线时的行为（2026-11-21）
+
+旧版本兜底是「nvidia-smi 失败 → 100%」，调试时驱动一掉风扇就狂转，很吵。
+现在默认 `--fail-mode auto`：
+
+| 阶段 | 行为 |
+|---|---|
+| 正常 | 按曲线写 `pwm6`（`enable=1`）|
+| 读不到 nvidia-smi | **交还 BIOS 自动**（`enable=5`），不再写 pwm |
+| 驱动恢复 | 自动切回 `enable=1`，继续按曲线控制 |
+
+其他模式：`--fail-mode duty --fail-duty 60`（固定 60%）、`--fail-mode hold`（保持上次）。

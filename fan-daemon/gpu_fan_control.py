@@ -168,6 +168,8 @@ def main() -> int:
     ap.add_argument("--curve", default=DEFAULT_CURVE, help='temp:duty pairs, e.g. "40:20,60:45,80:90"')
     ap.add_argument("--min", type=float, default=15, dest="lo")
     ap.add_argument("--max", type=float, default=100, dest="hi")
+    ap.add_argument("--fail-mode", choices=["auto", "duty", "hold"], default="auto",
+                    help="nvidia-smi 失败时：auto=交还BIOS(默认) / duty=固定占空比 / hold=保持上次")
     ap.add_argument("--fail-duty", type=float, default=100)
     ap.add_argument("--hysteresis", type=float, default=3.0)
     ap.add_argument("--mem-temp", action="store_true", help="also consider memory temperature")
@@ -178,7 +180,7 @@ def main() -> int:
     a = ap.parse_args()
 
     curve = parse_curve(a.curve)
-    state = {"curve": curve, "stop": False, "mode": "manual"}
+    state = {"curve": curve, "stop": False, "mode": "manual", "degraded": False}
     lock = threading.Lock()
     path, name = find_hwmon()
     if path is None:
@@ -218,9 +220,30 @@ def main() -> int:
         temp = read_gpu_temp(a.mem_temp)
         if temp is None:
             fails += 1
-            duty = a.fail_duty
-            print(f"[warn] nvidia-smi 读取失败（{fails}），duty={duty:.0f}%", flush=True)
+            if a.fail_mode == "auto" and not state["degraded"]:
+                # 驱动掉线：GPU 不再跑计算，交还 BIOS 自动曲线，避免噪声
+                if not a.dry_run:
+                    write_attr(path, enable, 5)
+                state["degraded"] = True
+                print(f"[warn] nvidia-smi 读取失败（{fails}），已交还 BIOS 自动控制", flush=True)
+            elif a.fail_mode == "auto":
+                print(f"[warn] nvidia-smi 读取失败（{fails}），保持 BIOS 自动", flush=True)
+            elif a.fail_mode == "duty":
+                duty = a.fail_duty
+                print(f"[warn] nvidia-smi 读取失败（{fails}），duty={duty:.0f}%", flush=True)
+            else:
+                print(f"[warn] nvidia-smi 读取失败（{fails}），保持上次 duty={last if last is not None else '?'}", flush=True)
+            if a.fail_mode == "auto":
+                last = None
+                duty = None
         else:
+            if state["degraded"]:
+                state["degraded"] = False
+                with lock:
+                    mode = state["mode"]
+                if not a.dry_run and mode == "manual":
+                    write_attr(path, enable, 1)
+                print(f"驱动恢复（GPU {temp:.0f}°C），回到自定义曲线", flush=True)
             fails = 0
             with lock:
                 active = state["curve"]
@@ -231,11 +254,14 @@ def main() -> int:
                 duty = last
         with lock:
             mode = state["mode"]
-        if not a.dry_run and mode == "manual":
-            write_attr(path, pwm, int(round(duty / 100 * 255)))
-        else:
+        if not a.dry_run:
+            if mode == "manual" and duty is not None:
+                write_attr(path, pwm, int(round(duty / 100 * 255)))
+            # auto（BIOS 控制）或降级中：不写 pwm
+        elif duty is not None:
             print(f"(dry-run) {pwm}={int(round(duty / 100 * 255))} fan={read_attr(path, f'fan{a.pwm}_input')} RPM", flush=True)
-        last = duty
+        if duty is not None:
+            last = duty
         if a.once:
             break
         time.sleep(a.interval)
